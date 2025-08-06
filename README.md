@@ -334,7 +334,7 @@ If you use MANGO in your research, please cite:
 ```bibtex
 @inproceedings{mango2025,
   title={MANGO: Memory-Adaptive Neural Gradient Optimizer with Learned Compression},
-  author={Vinh Nguyen},
+  author={Vinh Dang},
   email={dqvinh87@gmail.com},
   booktitle={International Conference on Learning Representations},
   year={2025}
