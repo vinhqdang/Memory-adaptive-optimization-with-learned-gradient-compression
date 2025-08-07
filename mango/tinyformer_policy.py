@@ -217,8 +217,29 @@ class TinyFormerPolicyNet(nn.Module):
             nn.Linear(head_dim, 1)  # Binary decision
         )
         
-        # Value head for policy gradient training
-        self.value_head = nn.Sequential(
+        # Multi-objective value heads for policy gradient training
+        self.loss_value_head = nn.Sequential(
+            nn.Linear(d_model, head_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(head_dim, 1)
+        )
+        
+        self.memory_value_head = nn.Sequential(
+            nn.Linear(d_model, head_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(head_dim, 1)
+        )
+        
+        self.energy_value_head = nn.Sequential(
+            nn.Linear(d_model, head_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(head_dim, 1)
+        )
+        
+        self.time_value_head = nn.Sequential(
             nn.Linear(d_model, head_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -396,8 +417,14 @@ class TinyFormerPolicyNet(nn.Module):
         use_nf4_logits = self.use_nf4_head(final_repr)  # [1, 1]
         use_nf4_prob = torch.sigmoid(use_nf4_logits)
         
-        # Value estimate
-        value = self.value_head(final_repr)  # [1, 1]
+        # Multi-objective value estimates
+        loss_value = self.loss_value_head(final_repr)  # [1, 1]
+        memory_value = self.memory_value_head(final_repr)  # [1, 1]
+        energy_value = self.energy_value_head(final_repr)  # [1, 1]
+        time_value = self.time_value_head(final_repr)  # [1, 1]
+        
+        # Combined value (weighted sum)
+        value = loss_value + 0.1 * memory_value + 0.05 * energy_value + 0.02 * time_value
         
         # Convert probabilities to expected values
         rank_options = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], dtype=torch.float32, device=x.device)
@@ -422,8 +449,12 @@ class TinyFormerPolicyNet(nn.Module):
             'momentum_bits': int(bits_p_expected.item()),  # For compatibility
             'sparsity_ratio': 0.0,  # MANGO-LRQ uses low-rank instead of sparsity
             
-            # Policy training components
+            # Multi-objective policy training components
             'value': value.item(),
+            'loss_value': loss_value.item(),
+            'memory_value': memory_value.item(),
+            'energy_value': energy_value.item(),
+            'time_value': time_value.item(),
             'rank_logits': rank_logits,
             'bits_p_logits': bits_p_logits,
             'bits_q_logits': bits_q_logits,

@@ -27,6 +27,7 @@ from mango.enhanced_optimizer import EnhancedMANGO
 from mango.mango_lrq import CompressionConfig
 from mango.memory_profiler import create_memory_profiler, get_current_gpu_memory_gb, reset_peak_memory_stats
 from mango.amp_support import create_amp_context
+from mango.power_monitor import PowerMonitor
 
 
 class ResNet18CIFAR10(nn.Module):

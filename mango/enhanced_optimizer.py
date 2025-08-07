@@ -24,6 +24,8 @@ from .statistics import GradientStatistics
 from .utils import MemoryProfiler
 from .memory_profiler import MANGOMemoryProfiler, create_memory_profiler
 from .amp_support import AMPTrainingContext, MANGOGradScaler, create_amp_context
+from .ef21_buffer import EF21Buffer, EF21Compressor
+# from .power_monitor import PowerMonitor, MultiObjectiveReward  # Temporary disable due to syntax issues
 
 
 class EnhancedMANGO(torch.optim.Optimizer):
@@ -114,8 +116,16 @@ class EnhancedMANGO(torch.optim.Optimizer):
         
         if self.use_mango_lrq:
             self.compressor = MangoLRQCompressor(self.compression_config)
+            # Add EF21 buffer for enhanced variance reduction
+            self.ef21_buffer = EF21Buffer(
+                momentum_factor=0.9,
+                variance_reduction=self.compression_config.variance_reduction,
+                adaptive_compression=True,
+                reference_steps=self.compression_config.reference_steps
+            )
         else:
             self.compressor = GradientCompressor(error_feedback=error_feedback)
+            self.ef21_buffer = None
         
         # Initialize policy network
         if policy_net is not None:
@@ -153,6 +163,10 @@ class EnhancedMANGO(torch.optim.Optimizer):
             self.memory_profiler = create_memory_profiler(profiler_output_dir)
         else:
             self.memory_profiler = None
+        
+        # Power monitoring (optional)
+        self.power_monitor = None
+        self.multi_objective_reward = None
         
         # AMP support
         if self.enable_amp:
@@ -204,6 +218,30 @@ class EnhancedMANGO(torch.optim.Optimizer):
         """Set AMP context for mixed precision training."""
         self.amp_context = amp_context
         self.enable_amp = amp_context.is_enabled()
+    
+    # Power monitoring methods temporarily disabled
+    # def set_power_monitor(self, power_monitor: PowerMonitor):
+    #     """Set power monitor for energy-aware optimization."""
+    #     self.power_monitor = power_monitor
+    #     self.multi_objective_reward = MultiObjectiveReward(
+    #         power_monitor=power_monitor,
+    #         loss_weight=1.0,
+    #         memory_weight=0.1,
+    #         energy_weight=0.05,
+    #         time_weight=0.02
+    #     )
+    # 
+    # def compute_multi_objective_reward(
+    #     self, 
+    #     loss: float,
+    #     training_time: float
+    # ) -> Tuple[float, Dict[str, float]]:
+    #     """Compute multi-objective reward for policy training."""
+    #     if self.multi_objective_reward is None:
+    #         return 0.0, {}
+    #     
+    #     memory_usage = self.get_memory_usage().get('current_memory_gb', 0.0)
+    #     return self.multi_objective_reward.compute_reward(loss, memory_usage, training_time)
     
     def collect_gradient_features(self) -> Dict[str, torch.Tensor]:
         """
@@ -492,13 +530,18 @@ class EnhancedMANGO(torch.optim.Optimizer):
         
         state = self.state[param]
         
-        # State initialization
+        # State initialization with optional 8-bit quantization
         if len(state) == 0:
             state['step'] = 0
             # Exponential moving average of gradient values
             state['exp_avg'] = torch.zeros_like(param, memory_format=torch.preserve_format)
             # Exponential moving average of squared gradient values
             state['exp_avg_sq'] = torch.zeros_like(param, memory_format=torch.preserve_format)
+            # 8-bit state tracking
+            state['use_8bit_states'] = self.compression_config.momentum_precision in ['int8', 'nf4']
+            if state['use_8bit_states']:
+                state['exp_avg_scale'] = torch.tensor(1.0, device=param.device)
+                state['exp_avg_sq_scale'] = torch.tensor(1.0, device=param.device)
         
         exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
         beta1, beta2 = group['betas']
@@ -517,10 +560,53 @@ class EnhancedMANGO(torch.optim.Optimizer):
         # Exponential moving average of squared gradient values
         exp_avg_sq.mul_(beta2).addcmul_(compressed_grad, compressed_grad, value=1 - beta2)
         
+        # Apply 8-bit quantization to optimizer states if enabled
+        if state.get('use_8bit_states', False) and state['step'] % 10 == 0:
+            exp_avg_quantized, exp_avg_scale = self._quantize_8bit_state(exp_avg)
+            exp_avg_sq_quantized, exp_avg_sq_scale = self._quantize_8bit_state(exp_avg_sq)
+            
+            # Store quantized states
+            state['exp_avg'].copy_(exp_avg_quantized)
+            state['exp_avg_sq'].copy_(exp_avg_sq_quantized)
+            state['exp_avg_scale'] = exp_avg_scale
+            state['exp_avg_sq_scale'] = exp_avg_sq_scale
+        
         denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group['eps'])
         step_size = group['lr'] / bias_correction1
         
         param.addcdiv_(exp_avg, denom, value=-step_size)
+    
+    def _quantize_8bit_state(self, tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Quantize optimizer state to 8-bit using dynamic quantization.
+        
+        Args:
+            tensor: State tensor to quantize
+            
+        Returns:
+            Tuple of (quantized_tensor, scale_factor)
+        """
+        if tensor.numel() == 0:
+            return tensor, torch.tensor(1.0, device=tensor.device)
+        
+        # Dynamic quantization to 8-bit range [-128, 127]
+        tensor_min = tensor.min()
+        tensor_max = tensor.max()
+        
+        if tensor_max == tensor_min:
+            return tensor, torch.tensor(1.0, device=tensor.device)
+        
+        # Calculate scale for 8-bit quantization
+        scale = (tensor_max - tensor_min) / 255.0
+        zero_point = tensor_min
+        
+        # Quantize to 8-bit integers
+        quantized = torch.round((tensor - zero_point) / scale).clamp(-128, 127)
+        
+        # Dequantize back to float
+        dequantized = quantized * scale + zero_point
+        
+        return dequantized, scale
     
     def _update_compression_stats(
         self, 
