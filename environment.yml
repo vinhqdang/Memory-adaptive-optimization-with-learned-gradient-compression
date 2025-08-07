@@ -9,10 +9,11 @@ dependencies:
   # Python
   - python=3.9
 
-  # PyTorch with CUDA support
-  - pytorch>=2.0.0
-  - torchvision>=0.15.0
+  # PyTorch with CUDA support  
+  - pytorch>=2.5.0
+  - torchvision>=0.20.0
   - pytorch-cuda=11.8
+  - transformers>=4.30.0
 
   # Core scientific computing
   - numpy>=1.21.0
@@ -46,3 +47,14 @@ dependencies:
   - black  # Code formatting
   - flake8  # Linting
   - isort  # Import sorting
+
+  # Additional pip dependencies for enhanced features
+  - pip
+  - pip:
+    - bitsandbytes>=0.41.0  # NF4 quantization
+    - accelerate>=0.20.0    # HuggingFace acceleration
+    - datasets>=2.10.0      # Dataset loading
+    - timm>=0.9.0          # Vision models
+    - wandb>=0.15.0        # Experiment tracking
+    - einops>=0.6.0        # Tensor operations
+    - flash-attn>=2.0.0    # Flash attention (optional)

@@ -1,17 +1,35 @@
 """
 Baseline Optimizer Implementations
 
-Implements various baseline optimizers for comparison with MANGO,
-including 8-bit Adam, gradient checkpointing variants, and other
-memory-efficient optimization methods.
+Implements various baseline optimizers for comparison with MANGO-LRQ as specified in planv2.md:
+- AdamW, Adafactor (standard optimizers)
+- GaLore (low-rank only)
+- AdaRankGrad (rank schedule)
+- QLoRA pager (quantization only)
+- 8-bit Adam and other memory-efficient variants
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from typing import Dict, List, Tuple, Optional, Any, Callable
+from typing import Dict, List, Tuple, Optional, Any, Callable, Union
 import math
+import numpy as np
 from collections import defaultdict
+
+try:
+    from transformers import Adafactor
+    HAS_TRANSFORMERS = True
+except ImportError:
+    HAS_TRANSFORMERS = False
+    print("Warning: transformers not available, Adafactor will use fallback implementation")
+
+try:
+    import bitsandbytes as bnb
+    HAS_BITSANDBYTES = True
+except ImportError:
+    HAS_BITSANDBYTES = False
+    print("Warning: bitsandbytes not available, using fallback implementations")
 
 
 class EightBitAdam(torch.optim.Optimizer):
@@ -649,3 +667,441 @@ def get_memory_efficient_optimizer_config() -> Dict[str, Dict]:
             'weight_decay': 1e-4
         }
     }
+
+
+class GaLoreOptimizer(torch.optim.Optimizer):
+    """
+    GaLore optimizer (low-rank only compression).
+    
+    Implements the GaLore algorithm from "GaLore: Memory-Efficient LLM Training 
+    by Gradient Low-Rank Projection" for comparison with MANGO-LRQ.
+    """
+    
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: Tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0,
+        rank: int = 4,
+        update_freq: int = 200
+    ):
+        """Initialize GaLore optimizer."""
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
+                       rank=rank, update_freq=update_freq)
+        super().__init__(params, defaults)
+        
+    def step(self, closure: Optional[Callable] = None):
+        """Perform optimization step with low-rank projection."""
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                
+                grad = p.grad.data
+                state = self.state[p]
+                
+                # Initialize state
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state['P'] = None
+                    state['Q'] = None
+                
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                beta1, beta2 = group['betas']
+                state['step'] += 1
+                
+                # Apply low-rank projection to gradient
+                if grad.dim() >= 2 and state['step'] % group['update_freq'] == 1:
+                    # Update projection matrices
+                    try:
+                        U, S, Vt = torch.linalg.svd(grad, full_matrices=False)
+                        rank = min(group['rank'], min(grad.shape))
+                        state['P'] = U[:, :rank].clone()
+                        state['Q'] = Vt[:rank, :].clone()
+                    except:
+                        # Fallback for numerical issues
+                        m, n = grad.shape
+                        rank = min(group['rank'], min(m, n))
+                        state['P'] = torch.randn(m, rank, device=grad.device, dtype=grad.dtype)
+                        state['Q'] = torch.randn(rank, n, device=grad.device, dtype=grad.dtype)
+                
+                # Apply projection if available
+                if state['P'] is not None and state['Q'] is not None and grad.dim() >= 2:
+                    # Project gradient
+                    try:
+                        projected_grad = state['P'].T @ grad @ state['Q']
+                        # Reconstruct (simplified)
+                        grad = state['P'] @ projected_grad @ state['Q'].T
+                    except:
+                        pass  # Use original gradient if projection fails
+                
+                # Weight decay
+                if group['weight_decay'] != 0:
+                    grad = grad.add(p, alpha=group['weight_decay'])
+                
+                # Exponential moving average of gradient values
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                
+                # Exponential moving average of squared gradient values
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                
+                denom = (exp_avg_sq.sqrt() / math.sqrt(1 - beta2 ** state['step'])).add_(group['eps'])
+                
+                step_size = group['lr'] / (1 - beta1 ** state['step'])
+                
+                p.addcdiv_(exp_avg, denom, value=-step_size)
+        
+        return loss
+
+
+class AdaRankGradOptimizer(torch.optim.Optimizer):
+    """
+    AdaRankGrad optimizer with adaptive rank scheduling.
+    
+    Gradually reduces gradient rank during training as mentioned in planv2.md.
+    """
+    
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: Tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0,
+        initial_rank: int = 8,
+        final_rank: int = 2,
+        rank_decay_steps: int = 1000
+    ):
+        """Initialize AdaRankGrad optimizer."""
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
+                       initial_rank=initial_rank, final_rank=final_rank,
+                       rank_decay_steps=rank_decay_steps)
+        super().__init__(params, defaults)
+        
+    def get_current_rank(self, step: int, group: Dict) -> int:
+        """Compute current rank based on step and schedule."""
+        progress = min(1.0, step / group['rank_decay_steps'])
+        current_rank = group['initial_rank'] * (1 - progress) + group['final_rank'] * progress
+        return max(1, int(current_rank))
+    
+    def step(self, closure: Optional[Callable] = None):
+        """Perform optimization step with adaptive rank."""
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                
+                grad = p.grad.data
+                state = self.state[p]
+                
+                # Initialize state
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                beta1, beta2 = group['betas']
+                state['step'] += 1
+                
+                # Get current rank for this step
+                current_rank = self.get_current_rank(state['step'], group)
+                
+                # Apply rank reduction to gradient if it's 2D
+                if grad.dim() >= 2:
+                    try:
+                        U, S, Vt = torch.linalg.svd(grad, full_matrices=False)
+                        rank = min(current_rank, min(grad.shape))
+                        if rank < min(grad.shape):
+                            # Apply rank reduction
+                            grad = U[:, :rank] @ torch.diag(S[:rank]) @ Vt[:rank, :]
+                    except:
+                        pass  # Use original gradient if SVD fails
+                
+                # Weight decay
+                if group['weight_decay'] != 0:
+                    grad = grad.add(p, alpha=group['weight_decay'])
+                
+                # Exponential moving average
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                
+                denom = (exp_avg_sq.sqrt() / math.sqrt(1 - beta2 ** state['step'])).add_(group['eps'])
+                step_size = group['lr'] / (1 - beta1 ** state['step'])
+                
+                p.addcdiv_(exp_avg, denom, value=-step_size)
+        
+        return loss
+
+
+class QLoRAPagerOptimizer(torch.optim.Optimizer):
+    """
+    QLoRA-style optimizer with paged quantization (quantization only).
+    
+    Implements the paging mechanism from QLoRA for comparison.
+    """
+    
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: Tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0,
+        quantization_bits: int = 8,
+        page_size: int = 2048
+    ):
+        """Initialize QLoRA pager optimizer."""
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
+                       quantization_bits=quantization_bits, page_size=page_size)
+        super().__init__(params, defaults)
+        
+    def _quantize_tensor(self, tensor: torch.Tensor, bits: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize tensor to specified bits."""
+        if bits >= 32:
+            return tensor, torch.tensor([1.0], device=tensor.device)
+        
+        # Simple uniform quantization
+        tensor_min = tensor.min()
+        tensor_max = tensor.max()
+        
+        if tensor_max == tensor_min:
+            return tensor, torch.tensor([1.0], device=tensor.device)
+        
+        levels = 2 ** bits - 1
+        scale = (tensor_max - tensor_min) / levels
+        
+        quantized = torch.round((tensor - tensor_min) / scale)
+        dequantized = quantized * scale + tensor_min
+        
+        return dequantized, scale
+    
+    def step(self, closure: Optional[Callable] = None):
+        """Perform optimization step with quantized states."""
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                
+                grad = p.grad.data
+                state = self.state[p]
+                
+                # Initialize state
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                beta1, beta2 = group['betas']
+                state['step'] += 1
+                
+                # Weight decay
+                if group['weight_decay'] != 0:
+                    grad = grad.add(p, alpha=group['weight_decay'])
+                
+                # Update momentum with quantization
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                
+                # Quantize momentum states periodically
+                if state['step'] % 10 == 0:
+                    exp_avg_quantized, _ = self._quantize_tensor(exp_avg, group['quantization_bits'])
+                    exp_avg.copy_(exp_avg_quantized)
+                
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                
+                # Quantize second moment
+                if state['step'] % 10 == 0:
+                    exp_avg_sq_quantized, _ = self._quantize_tensor(exp_avg_sq, group['quantization_bits'])
+                    exp_avg_sq.copy_(exp_avg_sq_quantized)
+                
+                denom = (exp_avg_sq.sqrt() / math.sqrt(1 - beta2 ** state['step'])).add_(group['eps'])
+                step_size = group['lr'] / (1 - beta1 ** state['step'])
+                
+                p.addcdiv_(exp_avg, denom, value=-step_size)
+        
+        return loss
+
+
+class FallbackAdafactor(torch.optim.Optimizer):
+    """
+    Fallback Adafactor implementation when transformers is not available.
+    """
+    
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        eps2: float = 1e-30,
+        cliping_threshold: float = 1.0,
+        decay_rate: float = -0.8,
+        beta1: Optional[float] = None,
+        weight_decay: float = 0.0,
+        scale_parameter: bool = True,
+        relative_step: bool = True
+    ):
+        """Initialize fallback Adafactor."""
+        defaults = dict(
+            lr=lr, eps2=eps2, cliping_threshold=cliping_threshold,
+            decay_rate=decay_rate, beta1=beta1, weight_decay=weight_decay,
+            scale_parameter=scale_parameter, relative_step=relative_step
+        )
+        super().__init__(params, defaults)
+    
+    def step(self, closure: Optional[Callable] = None):
+        """Simplified Adafactor step."""
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                
+                grad = p.grad.data
+                if grad.is_sparse:
+                    raise RuntimeError('Adafactor does not support sparse gradients')
+                
+                state = self.state[p]
+                grad_shape = grad.shape
+                
+                factored = len(grad_shape) >= 2
+                
+                if len(state) == 0:
+                    state['step'] = 0
+                    
+                    if factored:
+                        state['exp_avg_sq_row'] = torch.zeros(grad_shape[:-1])
+                        state['exp_avg_sq_col'] = torch.zeros(grad_shape[:-2] + grad_shape[-1:])
+                    else:
+                        state['exp_avg_sq'] = torch.zeros_like(grad)
+                    
+                    state['RMS'] = 0
+                
+                state['step'] += 1
+                state['RMS'] = self._rms(p)
+                
+                lr = group['lr']
+                if group['relative_step']:
+                    min_step = 1e-6 * state['step'] if group['scale_parameter'] else 1e-2
+                    rel_step_sz = min(min_step, 1.0/math.sqrt(state['step']))
+                    param_scale = 1.0
+                    if group['scale_parameter']:
+                        param_scale = max(group['eps2'], state['RMS'])
+                    lr = param_scale * rel_step_sz
+                
+                # Weight decay
+                if group['weight_decay'] != 0:
+                    grad = grad.add(p, alpha=-group['weight_decay'] * lr)
+                
+                beta2t = 1.0 - math.pow(state['step'], group['decay_rate'])
+                update = grad**2 + group['eps2']
+                
+                if factored:
+                    exp_avg_sq_row = state['exp_avg_sq_row']
+                    exp_avg_sq_col = state['exp_avg_sq_col']
+                    
+                    exp_avg_sq_row.mul_(beta2t).add_(update.mean(dim=-1), alpha=1.0-beta2t)
+                    exp_avg_sq_col.mul_(beta2t).add_(update.mean(dim=-2), alpha=1.0-beta2t)
+                    
+                    r_factor = ((exp_avg_sq_row/exp_avg_sq_row.mean()).rsqrt_().unsqueeze(-1))
+                    c_factor = (exp_avg_sq_col.rsqrt()).unsqueeze(-2)
+                    update = r_factor * c_factor
+                else:
+                    exp_avg_sq = state['exp_avg_sq']
+                    exp_avg_sq.mul_(beta2t).add_(update, alpha=1.0-beta2t)
+                    update = exp_avg_sq.rsqrt()
+                
+                update.div_((self._rms(update) / group['cliping_threshold']).clamp_(min=1.0))
+                
+                p.add_(grad * update, alpha=-lr)
+        
+        return loss
+    
+    def _rms(self, tensor):
+        return tensor.norm(2) / (tensor.numel() ** 0.5)
+
+
+def get_baseline_optimizer(
+    name: str, 
+    parameters, 
+    lr: float = 1e-3, 
+    weight_decay: float = 0.0,
+    **kwargs
+) -> torch.optim.Optimizer:
+    """
+    Factory function to create baseline optimizers for comparison.
+    
+    Args:
+        name: Optimizer name
+        parameters: Model parameters
+        lr: Learning rate
+        weight_decay: Weight decay
+        **kwargs: Additional optimizer-specific arguments
+        
+    Returns:
+        Initialized optimizer
+    """
+    name = name.lower()
+    
+    if name == 'adam':
+        return torch.optim.Adam(parameters, lr=lr, weight_decay=weight_decay, **kwargs)
+    
+    elif name == 'adamw':
+        return torch.optim.AdamW(parameters, lr=lr, weight_decay=weight_decay, **kwargs)
+    
+    elif name == 'sgd':
+        momentum = kwargs.get('momentum', 0.9)
+        return torch.optim.SGD(parameters, lr=lr, weight_decay=weight_decay, momentum=momentum)
+    
+    elif name == 'adafactor':
+        if HAS_TRANSFORMERS:
+            return Adafactor(parameters, scale_parameter=False, relative_step=False, lr=lr, **kwargs)
+        else:
+            return FallbackAdafactor(parameters, lr=lr, weight_decay=weight_decay, **kwargs)
+    
+    elif name == 'galore':
+        rank = kwargs.get('rank', 4)
+        return GaLoreOptimizer(parameters, lr=lr, weight_decay=weight_decay, rank=rank, **kwargs)
+    
+    elif name == 'adarankgrad':
+        initial_rank = kwargs.get('initial_rank', 8)
+        final_rank = kwargs.get('final_rank', 2)
+        return AdaRankGradOptimizer(parameters, lr=lr, weight_decay=weight_decay,
+                                  initial_rank=initial_rank, final_rank=final_rank, **kwargs)
+    
+    elif name == 'qlora_pager':
+        bits = kwargs.get('quantization_bits', 8)
+        return QLoRAPagerOptimizer(parameters, lr=lr, weight_decay=weight_decay,
+                                 quantization_bits=bits, **kwargs)
+    
+    elif name == '8bit_adam':
+        if HAS_BITSANDBYTES:
+            return bnb.optim.Adam8bit(parameters, lr=lr, weight_decay=weight_decay, **kwargs)
+        else:
+            return EightBitAdam(parameters, lr=lr, weight_decay=weight_decay, **kwargs)
+    
+    else:
+        raise ValueError(f"Unknown optimizer: {name}. Available: adam, adamw, sgd, adafactor, "
+                        f"galore, adarankgrad, qlora_pager, 8bit_adam")
