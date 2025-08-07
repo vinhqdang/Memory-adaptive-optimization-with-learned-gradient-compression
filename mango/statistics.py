@@ -124,6 +124,29 @@ class GradientStatistics:
             return float(np.var(recent_norms))
         return 0.0
     
+    def get_hessian_estimate(self, param_id: int, current_grad: torch.Tensor) -> float:
+        """
+        Estimate Hessian diagonal using gradient differences.
+        
+        Uses finite differences of gradients to approximate diagonal Hessian elements.
+        """
+        if param_id not in self.gradient_directions or len(self.gradient_directions[param_id]) < 2:
+            return 0.0
+        
+        # Get recent gradient directions
+        directions = self.gradient_directions[param_id]
+        if len(directions) < 2:
+            return 0.0
+        
+        current_dir = directions[-1]
+        prev_dir = directions[-2]
+        
+        # Estimate Hessian diagonal as gradient difference magnitude
+        grad_diff = current_dir - prev_dir
+        hessian_estimate = grad_diff.norm().item()
+        
+        return hessian_estimate
+    
     def get_gradient_direction_change(self, param_id: int) -> float:
         """
         Get the angle between current and previous gradient direction.

@@ -158,7 +158,7 @@ class TinyFormerPolicyNet(nn.Module):
         
         # Input projection and feature preprocessing
         self.feature_projector = nn.Sequential(
-            nn.Linear(32, feature_dim),  # Raw features to intermediate
+            nn.Linear(35, feature_dim),  # Raw features to intermediate (increased for power features)
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(feature_dim, d_model),  # Project to model dimension
@@ -279,7 +279,7 @@ class TinyFormerPolicyNet(nn.Module):
         Process raw gradient statistics into network input.
         
         Args:
-            raw_features: Dictionary of gradient statistics
+            raw_features: Dictionary of gradient statistics including power data
             
         Returns:
             Processed feature tensor [batch_size, feature_dim]
@@ -290,7 +290,13 @@ class TinyFormerPolicyNet(nn.Module):
         # Global features
         step_ratio = raw_features.get('step_ratio', torch.tensor([0.0]))
         memory_usage = raw_features.get('memory_usage', torch.tensor([0.0]))
-        features.extend([step_ratio, memory_usage])
+        
+        # Power-related features from PowerSampler EWMA
+        ewma_power = raw_features.get('ewma_power', torch.tensor([0.0]))
+        power_efficiency = raw_features.get('power_efficiency', torch.tensor([0.0]))
+        gpu_utilization = raw_features.get('gpu_utilization', torch.tensor([0.0]))
+        
+        features.extend([step_ratio, memory_usage, ewma_power, power_efficiency, gpu_utilization])
         
         # Parameter group features (aggregate across groups)
         for i in range(self.num_parameter_groups):
@@ -320,13 +326,13 @@ class TinyFormerPolicyNet(nn.Module):
                 momentum_align_mean, log_param_count, max_depth
             ])
         
-        # Pad or truncate to expected size
-        while len(features) < 32:
+        # Pad or truncate to expected size (increased to 35 to accommodate power features)
+        while len(features) < 35:
             features.append(torch.tensor([0.0]))
-        features = features[:32]
+        features = features[:35]
         
-        # Stack into tensor
-        feature_tensor = torch.stack(features).unsqueeze(0)  # [1, 32]
+        # Stack into tensor and flatten
+        feature_tensor = torch.stack(features).flatten().unsqueeze(0)  # [1, 35]
         
         return feature_tensor
     

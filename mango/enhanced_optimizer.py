@@ -16,6 +16,13 @@ import math
 from collections import defaultdict
 import warnings
 
+try:
+    import bitsandbytes as bnb
+    HAS_BITSANDBYTES = True
+except ImportError:
+    HAS_BITSANDBYTES = False
+    print("Warning: bitsandbytes not available, falling back to manual 8-bit states")
+
 from .compression import GradientCompressor
 from .mango_lrq import MangoLRQCompressor, CompressionConfig
 from .tinyformer_policy import TinyFormerPolicyNet, TinyFormerConfig
@@ -56,7 +63,8 @@ class EnhancedMANGO(torch.optim.Optimizer):
         policy_update_freq: int = 100,
         enable_amp: bool = True,
         enable_profiling: bool = True,
-        profiler_output_dir: str = "./profiler_logs"
+        profiler_output_dir: str = "./profiler_logs",
+        use_8bit_optimizer: bool = True
     ):
         """
         Initialize Enhanced MANGO optimizer.
@@ -77,6 +85,7 @@ class EnhancedMANGO(torch.optim.Optimizer):
             enable_amp: Whether to enable automatic mixed precision (default: True)
             enable_profiling: Whether to enable memory profiling (default: True)
             profiler_output_dir: Directory for profiling outputs (default: "./profiler_logs")
+            use_8bit_optimizer: Whether to use 8-bit optimizer states with bitsandbytes (default: True)
         """
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -101,6 +110,7 @@ class EnhancedMANGO(torch.optim.Optimizer):
         self.use_tinyformer = use_tinyformer
         self.enable_amp = enable_amp and torch.cuda.is_available()
         self.enable_profiling = enable_profiling
+        self.use_8bit_optimizer = use_8bit_optimizer and HAS_BITSANDBYTES
         
         # Initialize compression components
         self.compression_config = compression_config or CompressionConfig(
@@ -192,6 +202,11 @@ class EnhancedMANGO(torch.optim.Optimizer):
         
         # Initialize parameter tracking
         self._initialize_parameter_tracking()
+        
+        # Initialize 8-bit optimizer states if enabled
+        self._8bit_optimizer_states = {}
+        if self.use_8bit_optimizer:
+            self._initialize_8bit_states()
     
     def _estimate_memory_budget(self) -> int:
         """Estimate available memory budget based on current GPU memory."""
@@ -218,6 +233,16 @@ class EnhancedMANGO(torch.optim.Optimizer):
         """Set AMP context for mixed precision training."""
         self.amp_context = amp_context
         self.enable_amp = amp_context.is_enabled()
+    
+    def set_power_sampler(self, power_sampler):
+        """
+        Set power sampler for energy-aware optimization.
+        
+        Args:
+            power_sampler: PowerSampler instance from utils.power_sampler
+        """
+        self.power_sampler = power_sampler
+        print("Power sampler integrated for energy-aware optimization")
     
     # Power monitoring methods temporarily disabled
     # def set_power_monitor(self, power_monitor: PowerMonitor):
@@ -316,7 +341,9 @@ class EnhancedMANGO(torch.optim.Optimizer):
         features['step_ratio'] = torch.tensor([min(1.0, self.step_count / 10000)], dtype=torch.float32)
         
         if self.memory_profiler and self.enable_profiling:
-            memory_usage = self.memory_profiler.get_current_gpu_memory_gb() / 24.0  # Normalize by typical GPU memory
+            # Use the standalone function from memory_profiler module
+            from .memory_profiler import get_current_gpu_memory_gb
+            memory_usage = get_current_gpu_memory_gb() / 24.0  # Normalize by typical GPU memory
             features['memory_usage'] = torch.tensor([memory_usage], dtype=torch.float32)
         else:
             features['memory_usage'] = torch.tensor([0.5], dtype=torch.float32)
@@ -324,6 +351,21 @@ class EnhancedMANGO(torch.optim.Optimizer):
         # Training phase indicators
         features['training_phase'] = torch.tensor([self._get_training_phase()], dtype=torch.float32)
         features['loss_plateau'] = torch.tensor([self._detect_loss_plateau()], dtype=torch.float32)
+        
+        # Power-related features from PowerSampler (if available)
+        if hasattr(self, 'power_sampler') and self.power_sampler is not None:
+            ewma_power = self.power_sampler.get_ewma_power()
+            power_stats = self.power_sampler.get_power_statistics()
+            
+            # Normalize power values (typical GPU power is 50-350W)
+            features['ewma_power'] = torch.tensor([ewma_power / 300.0], dtype=torch.float32)
+            features['power_efficiency'] = torch.tensor([power_stats.get('mean_utilization_percent', 0.0) / 100.0], dtype=torch.float32)
+            features['gpu_utilization'] = torch.tensor([power_stats.get('mean_utilization_percent', 0.0) / 100.0], dtype=torch.float32)
+        else:
+            # Default values when power sampling is not available
+            features['ewma_power'] = torch.tensor([0.0], dtype=torch.float32)
+            features['power_efficiency'] = torch.tensor([0.0], dtype=torch.float32) 
+            features['gpu_utilization'] = torch.tensor([0.0], dtype=torch.float32)
         
         return features
     
@@ -519,6 +561,7 @@ class EnhancedMANGO(torch.optim.Optimizer):
     ):
         """
         Update parameter using Adam with compressed gradients.
+        Uses 8-bit optimizer states via bitsandbytes when available.
         
         Args:
             param: Parameter tensor
@@ -526,6 +569,14 @@ class EnhancedMANGO(torch.optim.Optimizer):
             group: Parameter group configuration
         """
         if compressed_grad is None or compressed_grad.numel() == 0:
+            return
+        
+        # Try to use bitsandbytes 8-bit optimizer if available
+        bnb_optimizer = self._get_8bit_optimizer_for_param(param)
+        if bnb_optimizer is not None:
+            # Set the compressed gradient and perform 8-bit optimizer step
+            param.grad = compressed_grad
+            bnb_optimizer.step()
             return
         
         state = self.state[param]
@@ -607,6 +658,47 @@ class EnhancedMANGO(torch.optim.Optimizer):
         dequantized = quantized * scale + zero_point
         
         return dequantized, scale
+    
+    def _initialize_8bit_states(self):
+        """Initialize 8-bit optimizer states using bitsandbytes if available."""
+        if not self.use_8bit_optimizer or not HAS_BITSANDBYTES:
+            return
+        
+        print("Initializing 8-bit optimizer states with bitsandbytes")
+        
+        # Create 8-bit optimizer for each parameter group
+        for group_idx, group in enumerate(self.param_groups):
+            # Filter parameters that require gradients
+            trainable_params = [p for p in group['params'] if p.requires_grad]
+            
+            if trainable_params:
+                # Create bitsandbytes 8-bit Adam optimizer for this group
+                bnb_optimizer = bnb.optim.Adam8bit(
+                    trainable_params,
+                    lr=group['lr'],
+                    betas=group['betas'],
+                    eps=group['eps'],
+                    weight_decay=group['weight_decay'],
+                    amsgrad=False
+                    # Note: Adam8bit uses 8-bit states internally by default
+                )
+                
+                self._8bit_optimizer_states[group_idx] = bnb_optimizer
+                print(f"Group {group_idx}: {len(trainable_params)} parameters with 8-bit states")
+    
+    def _get_8bit_optimizer_for_param(self, param) -> Optional[object]:
+        """Get the 8-bit optimizer instance for a given parameter."""
+        if not self.use_8bit_optimizer:
+            return None
+        
+        # Find which group this parameter belongs to by comparing parameter IDs
+        param_id = id(param)
+        for group_idx, group in enumerate(self.param_groups):
+            for p in group['params']:
+                if id(p) == param_id:
+                    return self._8bit_optimizer_states.get(group_idx)
+        
+        return None
     
     def _update_compression_stats(
         self, 
