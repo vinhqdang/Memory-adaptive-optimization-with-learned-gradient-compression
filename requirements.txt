@@ -31,5 +31,26 @@ scikit-learn>=1.0.0
 # Memory profiling (optional)
 memory-profiler>=0.60.0
 
+# Machine Learning and NLP
+transformers>=4.30.0
+datasets>=2.10.0
+tokenizers>=0.13.0
+
+# Quantization and compression (optional, requires CUDA)
+# bitsandbytes>=0.41.0  # Install manually: pip install bitsandbytes
+
+# Configuration management
+pyyaml>=6.0
+
+# Distributed training (optional)
+accelerate>=0.20.0
+
+# Weights and Biases (optional)
+wandb>=0.15.0
+
+# Additional utilities
+peft>=0.4.0  # For LoRA
+einops>=0.6.0  # For tensor operations
+
 # For CUDA support (install appropriate version)
 # torch with CUDA: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
