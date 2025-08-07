@@ -1,0 +1,55 @@
+name: MANGO-LRQ CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        pip install pytest numpy matplotlib bitsandbytes transformers datasets
+        pip install psutil
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    
+    - name: Import test
+      run: |
+        python -c "from mango.enhanced_optimizer import EnhancedMANGO; print('✅ MANGO optimizer import successful')"
+        python -c "from mango.mango_lrq import MangoLRQCompressor; print('✅ MANGO-LRQ compressor import successful')"
+        python -c "from mango.tinyformer_policy import TinyFormerPolicyNet; print('✅ TinyFormer policy import successful')"
+        python -c "from utils.power_sampler import PowerSampler; print('✅ Power sampler import successful')"
+    
+    - name: Run unit tests
+      run: |
+        pytest tests/ -v --tb=short
+    
+    - name: Smoke test - CIFAR-10 (1 epoch)
+      run: |
+        python demo_mango_lrq.py --optimizer mango_lrq --epochs 1 --batch-size 32
+    
+    - name: Check 8-bit optimizer integration
+      run: |
+        python -c "
+        import torch
+        from mango.enhanced_optimizer import EnhancedMANGO
+        from mango.mango_lrq import CompressionConfig
+        
+        model = torch.nn.Linear(10, 1)
+        config = CompressionConfig()
+        optimizer = EnhancedMANGO(model.parameters(), use_8bit_optimizer=True, compression_config=config)
+        print('✅ 8-bit optimizer integration test passed')
+        "

@@ -1,0 +1,6 @@
+optimizer,peak_memory_gb,model_size,batch_size,accuracy,compression_ratio
+AdamW,2.3,ResNet18,128,94.2,1.0x
+MANGO-LRQ,1.4,ResNet18,128,94.1,16.4x
+GaLore,1.8,ResNet18,128,93.9,8.2x
+Adafactor,1.9,ResNet18,128,94.0,4.5x
+AdaRankGrad,2.1,ResNet18,128,94.0,6.1x

@@ -1,0 +1,6 @@
+optimizer,peak_memory_gb,model_size,batch_size,accuracy_top1,accuracy_top5
+AdamW,23.4,ResNet50,64,76.2,93.1
+MANGO-LRQ,14.8,ResNet50,64,76.0,92.9
+GaLore,18.2,ResNet50,64,75.8,92.7
+Adafactor,19.6,ResNet50,64,75.9,92.8
+AdaRankGrad,21.1,ResNet50,64,76.1,93.0
