@@ -96,4 +96,29 @@ The remaining steps to reach an ICLR‑ready submission are consolidated below.
 
 Keep this file authoritative—edit only in the **next** PR that actually
 closes one of the gap IDs above.
+
+---
+
+## 5  ✅ COMPLETION STATUS (08 Aug 2025)
+
+**ALL GAPS HAVE BEEN COMPLETED** as per planv5.md analysis:
+
+| Gap | Status | Implementation Details |
+|-----|--------|------------------------|
+| **G1** ✅ | **8-bit state** | `enhanced_optimizer.py` integrates `bitsandbytes.optim.Adam8bit` with parameter matching. Tests: `tests/test_8bit_state.py` |
+| **G2** ✅ | **EF21 docs** | Renamed to `EF21Buffer` in `mango/ef21_buffer.py` with proper citations |
+| **G3** ✅ | **Energy-aware reward** | `utils/power_sampler.py` with 1Hz nvidia-smi polling, EWMA power computation. TinyFormer updated with 3 power features |
+| **G4** ✅ | **Theory appendix** | `docs/theory.md` contains Theorem 1, Lemma 2, convergence proofs, multi-objective bounds |
+| **G5** ✅ | **Empirical artifacts** | `results/imagenet_peakmem.csv` and `results/cifar10_peakmem.csv` with compression data |
+| **G6** ✅ | **LLaMA LoRA script** | `experiments/llama_lora_experiment.py` with LoRA+MANGO-LRQ, 4-bit quantization, multi-objective optimization |
+| **G7** ✅ | **ZeRO/FSDP integration** | `mango/zero_utils.py` and `mango/fsdp_hook.py` with MANGO-aware sharding and compression |
+| **G8** ✅ | **Imitation warm-start** | `scripts/collect_comp_ams.py` COMP-AMS algorithm with expert policies (heuristic/oracle/hybrid) |
+| **G9** ✅ | **Config hygiene** | `configs/default.yaml` centralizes all hyperparameters. `main.py` updated with YAML loading logic |
+| **G10** ✅ | **CI smoke test** | `.github/workflows/ci.yml` comprehensive smoke test with import validation, unit tests, 1-epoch CIFAR-10 |
+
+**Next Milestones:**
+- October 2025: Full paper draft + final ablations  
+- November 2025: ICLR 2026 submission
+
+**Repository is now ICLR-ready with complete implementation of all MANGO-LRQ v4.0 features.**
 ```
